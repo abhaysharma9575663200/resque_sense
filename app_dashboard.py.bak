@@ -1,0 +1,485 @@
+"""
+ResQ_sense: Mission Control Web Dashboard.
+Interactive Streamlit application for disaster human detection, live webcam execution,
+custom model management, triage analysis, and incident reporting.
+
+Based on: Sharma & Dixit (2025), "Human Body Detection in Disaster Environments"
+"""
+
+import time
+import tempfile
+from pathlib import Path
+import cv2
+import numpy as np
+import pandas as pd
+from PIL import Image
+import streamlit as st
+
+from resq_sense.config import (
+    DEFAULT_MODEL_NAME,
+    DEFAULT_CONF_THRESHOLD,
+    DEFAULT_IOU_THRESHOLD,
+    AVAILABLE_FILTERS,
+    FILTER_NORMAL,
+    MODELS_DIR,
+    SNAPSHOTS_DIR,
+    INCIDENT_LOG_CSV,
+    COLOR_CRITICAL_HEX,
+    COLOR_WARNING_HEX,
+    COLOR_AMBULATORY_HEX,
+)
+from resq_sense.engine import ResQSenseEngine
+from resq_sense.vision_filters import apply_filter
+from resq_sense.tracker import SurvivorTracker
+from resq_sense.incident_logger import IncidentLogger
+
+# Page configuration
+st.set_page_config(
+    page_title="ResQ_sense | Disaster Search & Rescue AI",
+    page_icon="🚨",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# Custom Tactical CSS Styling
+st.markdown(
+    """
+    <style>
+    .main {
+        background-color: #0e1117;
+    }
+    .stMetric {
+        background-color: #1a1c24;
+        border-radius: 8px;
+        padding: 10px;
+        border-left: 4px solid #ff4b4b;
+    }
+    .triage-critical {
+        background-color: #ff3b3022;
+        border: 1px solid #ff3b30;
+        border-radius: 6px;
+        padding: 8px 12px;
+        color: #ff6b64;
+        font-weight: 600;
+    }
+    .triage-warning {
+        background-color: #ff950022;
+        border: 1px solid #ff9500;
+        border-radius: 6px;
+        padding: 8px 12px;
+        color: #ffb340;
+        font-weight: 600;
+    }
+    .triage-ambulatory {
+        background-color: #34c75922;
+        border: 1px solid #34c759;
+        border-radius: 6px;
+        padding: 8px 12px;
+        color: #5ce680;
+        font-weight: 600;
+    }
+    .header-banner {
+        padding: 14px 20px;
+        border-radius: 10px;
+        background: linear-gradient(90deg, #1f2430 0%, #2b1d24 100%);
+        border: 1px solid #3d4251;
+        margin-bottom: 20px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+@st.cache_resource
+def get_engine(model_path: str):
+    return ResQSenseEngine(model_path=model_path)
+
+
+def main():
+    st.markdown(
+        """
+        <div class="header-banner">
+            <h2 style="margin: 0; color: #f0f2f6;"> ResQ_sense : Disaster Search & Rescue Mission Control</h2>
+            <p style="margin: 5px 0 0 0; color: #a0aec0; font-size: 0.95rem;">
+                AI-Driven Human Body & Survivor Detection in Disaster Environments
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ================= SIDEBAR: TACTICAL CONTROL PANEL =================
+    st.sidebar.title("Explore")
+
+    # 1. Live Camera & Feed Controls
+    st.sidebar.subheader("1. Camera & Feed Setup")
+    cam_source_type = st.sidebar.radio(
+        "Video Feed Source:",
+        ["Live Webcam (Native OpenCV)", "Browser Camera Snapshot"],
+        index=0,
+        help="Select whether to stream directly via OpenCV or capture browser snapshots.",
+    )
+
+    if cam_source_type == "Live Webcam (Native OpenCV)":
+        cam_index = st.sidebar.selectbox(
+            "Select Camera Device:",
+            options=[0, 1, 2],
+            format_func=lambda x: f"Camera {x} (Built-in Webcam)" if x == 0 else f"Camera {x} (External USB Camera)",
+            index=0,
+            help="Camera 0 is your laptop's built-in webcam. Camera 1/2 are external USB cameras.",
+        )
+        run_btn = st.sidebar.checkbox("▶️ START LIVE STREAM", value=False)
+    else:
+        cam_index = 0
+        run_btn = False
+
+    st.sidebar.markdown("---")
+
+    # 2. Model Selection & Upload
+    st.sidebar.subheader("2. 🧠 Active AI Model")
+
+    # Scan existing models in models/
+    existing_models = [DEFAULT_MODEL_NAME]
+    if MODELS_DIR.exists():
+        for p in MODELS_DIR.glob("*.pt"):
+            if p.name not in existing_models:
+                existing_models.append(p.name)
+
+    selected_model_choice = st.sidebar.selectbox(
+        "Select Detection Model:",
+        existing_models,
+        index=0,
+        help="Choose standard YOLO or your custom-trained disaster model.",
+    )
+
+    # Option to upload custom weights (.pt)
+    uploaded_model_file = st.sidebar.file_uploader(
+        "Upload Custom Model (.pt):",
+        type=["pt"],
+        help="Upload custom YOLO weights trained on disaster survivors or rubble.",
+    )
+
+    active_model_path = selected_model_choice
+    if uploaded_model_file is not None:
+        saved_custom_path = MODELS_DIR / uploaded_model_file.name
+        with open(saved_custom_path, "wb") as f:
+            f.write(uploaded_model_file.getbuffer())
+        st.sidebar.success(f"Custom model saved: `{uploaded_model_file.name}`")
+        active_model_path = str(saved_custom_path)
+
+    st.sidebar.markdown("---")
+
+    # 3. Vision Filter Selector
+    st.sidebar.subheader("3. 🎛️ Disaster Preprocessing")
+    selected_filter = st.sidebar.selectbox(
+        "Sensor / Enhancement Mode:",
+        AVAILABLE_FILTERS,
+        index=0,
+        help="Simulates Thermal IR, CLAHE low-light penetration, or edge contrast.",
+    )
+
+    st.sidebar.markdown("---")
+
+    # 4. Threshold Controls
+    st.sidebar.subheader("4. ⚙️ Sensitivity & Thresholds")
+    conf_thresh = st.sidebar.slider(
+        "Confidence Threshold:",
+        min_value=0.10,
+        max_value=0.95,
+        value=DEFAULT_CONF_THRESHOLD,
+        step=0.05,
+        help="Lower values detect occluded or partially buried victims.",
+    )
+    iou_thresh = st.sidebar.slider(
+        "IoU Threshold (NMS):",
+        min_value=0.20,
+        max_value=0.80,
+        value=DEFAULT_IOU_THRESHOLD,
+        step=0.05,
+    )
+
+    st.sidebar.markdown("---")
+
+    # 5. Mission Info
+    st.sidebar.subheader("5. 📍 Sector & Alerts")
+    grid_sector = st.sidebar.text_input("Active Sector:", "Sector-Alpha-1")
+    enable_audio = st.sidebar.checkbox("Enable Audio Alert", value=True)
+
+    # Load Engine
+    try:
+        engine = get_engine(active_model_path)
+    except Exception as e:
+        st.error(f"Failed to load AI model '{active_model_path}': {e}")
+        return
+
+    tracker = SurvivorTracker()
+    logger = IncidentLogger()
+
+    # Main Tabs
+    tab_live, tab_media, tab_logs, tab_research = st.tabs([
+        "📹 Live Webcam Feed",
+        "🖼️ Image & Footage Analysis",
+        "📋 Incident Log & Triage",
+        "📚 Research Framework",
+    ])
+
+    # ================= TAB 1: LIVE WEBCAM =================
+    with tab_live:
+        st.subheader("Real-Time Webcam Human Body Detection")
+        st.caption("AI model running on live feed with disaster triage & posture assessment. Controls located in the left sidebar.")
+
+        # Top Telemetry Row
+        telemetry_cols = st.columns(4)
+        fps_metric = telemetry_cols[0].empty()
+        latency_metric = telemetry_cols[1].empty()
+        active_victims_metric = telemetry_cols[2].empty()
+        triage_status_metric = telemetry_cols[3].empty()
+
+        triage_banner_area = st.empty()
+        feed_placeholder = st.empty()
+
+        if cam_source_type == "Live Webcam (Native OpenCV)":
+            if not run_btn:
+                feed_placeholder.info(
+                    "⏸️ **Webcam Stream Standby**\n\n"
+                    "👉 Check **`▶️ START LIVE STREAM`** in the left **Tactical Control Panel** sidebar to start real-time detection."
+                )
+                fps_metric.metric("Stream FPS", "--")
+                latency_metric.metric("Latency", "-- ms")
+                active_victims_metric.metric("Active Survivors", "0")
+                triage_status_metric.metric("Triage Status", "STANDBY")
+            else:
+                # Open Camera
+                cap = cv2.VideoCapture(int(cam_index))
+                if not cap.isOpened():
+                    cap = cv2.VideoCapture(int(cam_index), cv2.CAP_DSHOW)
+
+                if not cap.isOpened():
+                    feed_placeholder.error(
+                        f"❌ Cannot access Camera {cam_index}.\n\n"
+                        f"👉 **Quick Fix**: In the left sidebar Control Panel, ensure **Camera 0 (Built-in Webcam)** is selected.\n\n"
+                        f"Also check if another application (e.g. Zoom, Teams, Windows Camera) is holding the camera."
+                    )
+                else:
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    prev_time = time.time()
+                    fps_val = 0.0
+
+                    try:
+                        while run_btn:
+                            ret, frame = cap.read()
+                            if not ret or frame is None:
+                                feed_placeholder.warning("Frame read failed or camera disconnected.")
+                                break
+
+                            curr_t = time.time()
+                            fps_val = 0.9 * fps_val + 0.1 * (1.0 / max(1e-5, (curr_t - prev_time)))
+                            prev_time = curr_t
+
+                            # 1. Apply Disaster Vision Preprocessing Filter
+                            enhanced = apply_filter(frame, selected_filter)
+
+                            # 2. Run AI Human Body Detection
+                            detections, lat_ms = engine.detect(
+                                enhanced,
+                                conf_threshold=conf_thresh,
+                                iou_threshold=iou_thresh,
+                            )
+
+                            # 3. Track Survivors
+                            tracked = tracker.update(detections)
+
+                            # 4. Log detections
+                            for det in tracked:
+                                logger.log_detection(frame, det, grid_sector=grid_sector)
+
+                            # 5. Render Tactical HUD
+                            hud_frame = engine.draw_hud(
+                                enhanced,
+                                tracked,
+                                fps=fps_val,
+                                latency_ms=lat_ms,
+                                filter_name=selected_filter,
+                                sector_name=grid_sector,
+                            )
+
+                            rgb_frame = cv2.cvtColor(hud_frame, cv2.COLOR_BGR2RGB)
+                            feed_placeholder.image(rgb_frame, channels="RGB", use_container_width=True)
+
+                            # 6. Update Telemetry Metrics
+                            fps_metric.metric("Stream FPS", f"{fps_val:.1f}")
+                            latency_metric.metric("Latency", f"{lat_ms:.0f} ms")
+                            active_victims_metric.metric("Active Survivors", len(tracked))
+
+                            c_crit = sum(1 for d in tracked if d["priority_rank"] == 1)
+                            c_warn = sum(1 for d in tracked if d["priority_rank"] == 2)
+                            c_amb = sum(1 for d in tracked if d["priority_rank"] == 3)
+
+                            if c_crit > 0:
+                                triage_status_metric.metric("Triage Status", "CRITICAL ⚠️")
+                                triage_banner_area.markdown(
+                                    f"<div class='triage-critical'>🚨 CRITICAL ALERT: {c_crit} Trapped/Lying survivor(s) detected!</div>",
+                                    unsafe_allow_html=True,
+                                )
+                            elif c_warn > 0:
+                                triage_status_metric.metric("Triage Status", "CAUTION ⚡")
+                                triage_banner_area.markdown(
+                                    f"<div class='triage-warning'>⚠️ CAUTION: {c_warn} Crouched/Partial survivor(s) in sector.</div>",
+                                    unsafe_allow_html=True,
+                                )
+                            elif c_amb > 0:
+                                triage_status_metric.metric("Triage Status", "AMBULATORY ✅")
+                                triage_banner_area.markdown(
+                                    f"<div class='triage-ambulatory'>✅ AMBULATORY: {c_amb} Standing/Mobile survivor(s).</div>",
+                                    unsafe_allow_html=True,
+                                )
+                            else:
+                                triage_status_metric.metric("Triage Status", "CLEAR")
+                                triage_banner_area.empty()
+
+                            time.sleep(0.01)
+
+                    finally:
+                        cap.release()
+
+        else:
+            # Browser Camera Snapshot
+            camera_input_img = st.camera_input("Take Camera Snapshot for Analysis")
+            if camera_input_img is not None:
+                bytes_data = camera_input_img.getvalue()
+                nparr = np.frombuffer(bytes_data, np.uint8)
+                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+                enhanced = apply_filter(frame, selected_filter)
+                detections, lat_ms = engine.detect(enhanced, conf_threshold=conf_thresh, iou_threshold=iou_thresh)
+                tracked = tracker.update(detections)
+
+                for det in tracked:
+                    logger.log_detection(frame, det, grid_sector=grid_sector)
+
+                hud_frame = engine.draw_hud(enhanced, tracked, latency_ms=lat_ms, filter_name=selected_filter, sector_name=grid_sector)
+                feed_placeholder.image(cv2.cvtColor(hud_frame, cv2.COLOR_BGR2RGB), use_container_width=True)
+
+                st.success(f"Detected {len(tracked)} survivor(s) in {lat_ms:.1f}ms.")
+
+    # ================= TAB 2: IMAGE & FOOTAGE ANALYSIS =================
+    with tab_media:
+        st.subheader("Disaster Drone / Rubble Image Analysis")
+        st.caption("Upload reconnaissance photos, drone aerial snapshots, or rubble images to inspect survivors.")
+
+        uploaded_img = st.file_uploader("Upload Image:", type=["jpg", "jpeg", "png", "bmp"])
+        if uploaded_img is not None:
+            image = Image.open(uploaded_img)
+            frame = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**Original Reconnaissance Image**")
+                st.image(image, use_container_width=True)
+
+            # Process
+            enhanced = apply_filter(frame, selected_filter)
+            detections, lat_ms = engine.detect(enhanced, conf_threshold=conf_thresh, iou_threshold=iou_thresh)
+            tracked = tracker.update(detections)
+
+            # Log
+            for det in tracked:
+                logger.log_detection(frame, det, grid_sector=grid_sector)
+
+            hud_frame = engine.draw_hud(
+                enhanced,
+                tracked,
+                latency_ms=lat_ms,
+                filter_name=selected_filter,
+                sector_name=grid_sector,
+            )
+
+            with col2:
+                st.markdown(f"**AI Detection Overlay ({selected_filter})**")
+                st.image(cv2.cvtColor(hud_frame, cv2.COLOR_BGR2RGB), use_container_width=True)
+
+            st.info(f"Analysis complete: Found **{len(tracked)}** individuals with latency **{lat_ms:.1f} ms**.")
+
+            if len(tracked) > 0:
+                st.markdown("#### Detected Survivor Breakdown")
+                det_records = []
+                for det in tracked:
+                    det_records.append({
+                        "Tracker ID": f"ID #{det.get('tracker_id', 'N/A')}",
+                        "Triage Level": det["triage_level"],
+                        "Posture": det["posture"],
+                        "Confidence": f"{det['confidence'] * 100:.1f}%",
+                        "Aspect Ratio (W/H)": det["aspect_ratio"],
+                        "Box (x1, y1, x2, y2)": str(det["box"]),
+                    })
+                st.dataframe(pd.DataFrame(det_records), use_container_width=True)
+
+    # ================= TAB 3: INCIDENT LOG & TRIAGE =================
+    with tab_logs:
+        st.subheader("Search & Rescue Mission Log")
+        st.caption("Auditable record of detected survivors, triage statuses, and snapshot crops.")
+
+        col_export, col_refresh = st.columns([4, 1])
+        with col_refresh:
+            if st.button("🔄 Refresh Logs"):
+                st.rerun()
+
+        if INCIDENT_LOG_CSV.exists():
+            df = pd.read_csv(INCIDENT_LOG_CSV)
+            if not df.empty:
+                st.dataframe(df.tail(50), use_container_width=True)
+
+                # CSV Download button
+                csv_bytes = df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    label="📥 Download Mission Log (CSV)",
+                    data=csv_bytes,
+                    file_name=f"resq_sense_mission_log_{int(time.time())}.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.info("Log is currently empty. Run live webcam or image analysis to log survivor detections.")
+        else:
+            st.info("No mission log file created yet.")
+
+        st.markdown("#### Recent Snapshot Evidence Gallery")
+        recent_crops = list(SNAPSHOTS_DIR.glob("*.jpg"))
+        recent_crops.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+        if recent_crops:
+            gallery_cols = st.columns(4)
+            for idx, snap_path in enumerate(recent_crops[:8]):
+                with gallery_cols[idx % 4]:
+                    st.image(str(snap_path), caption=snap_path.stem[:28], use_container_width=True)
+        else:
+            st.caption("No snapshots captured yet.")
+
+    # ================= TAB 4: RESEARCH FRAMEWORK =================
+    with tab_research:
+        st.subheader("Scientific Basis & Framework Design")
+        st.markdown(
+            """
+            This software is designed according to the framework outlined in:
+            > **"Human Body Detection in Disaster Environments: A Review of Framework Design and Development Strategies"**  
+            > *Vivek Sharma, Dr. Manish Dixit (September 2025)*  
+            > *Journal of Global Research in Electronics and Communication, 1(9), 01-06.*
+
+            ### 🔬 Addressed Disaster Challenges:
+            1. **Variable Body Postures (Qi & Lou, 2023)**:
+               - Trapped victims under rubble are frequently in a horizontal / prone posture.
+               - ResQ_sense evaluates bounding box geometry to flag **Lying/Trapped** survivors as highest triage priority (`CRITICAL / RED`).
+            2. **Adverse Environmental Visibility (Ponzini et al. 2025, Kalyan et al. 2024)**:
+               - Darkness, smoke, and dust are addressed via **Simulated Thermal (Inferno & Ironbow)** and **CLAHE Lightness Equalization**.
+            3. **Real-time Edge Efficiency**:
+               - Optimized stream processing capable of running at high FPS on portable edge devices and field rescue laptops.
+            4. **Risk Communication Principles**:
+               - **Accuracy & Timeliness**: Instantaneous detection and visual alerting.
+               - **Clarity & Simplicity**: Plain, color-coded triage indicators without complex terminology.
+               - **Transparency**: Auditable snapshot logging with coordinates and timestamps.
+            """
+        )
+
+
+if __name__ == "__main__":
+    main()
